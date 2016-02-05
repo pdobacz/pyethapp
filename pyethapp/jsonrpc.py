@@ -3,8 +3,8 @@ PROPAGATE_ERRORS = False
 
 ###############################
 
-import time
-from copy import copy, deepcopy
+import os
+from copy import deepcopy
 from decorator import decorator
 from collections import Iterable
 import inspect
@@ -18,6 +18,7 @@ from ethereum import processblock
 import gevent
 import gevent.wsgi
 import gevent.queue
+from gevent import socket
 import rlp
 from tinyrpc.dispatch import RPCDispatcher
 from tinyrpc.dispatch import public as public_
@@ -136,7 +137,8 @@ class JSONRPCServer(BaseService):
     default_config = dict(jsonrpc=dict(
         listen_port=4000,
         listen_host='127.0.0.1',
-        corsdomain=''))
+        corsdomain='',
+        ipcpath='/tmp/pyethapp.sock',))
 
     @classmethod
     def subdispatcher_classes(cls):
@@ -157,7 +159,19 @@ class JSONRPCServer(BaseService):
         # start wsgi server as a background-greenlet
         self.listen_port = self.config['jsonrpc']['listen_port']
         self.listen_host = self.config['jsonrpc']['listen_host']
-        self.wsgi_server = gevent.wsgi.WSGIServer((self.listen_host, self.listen_port),
+        listener = (self.listen_host, self.listen_port)
+        if True:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            fn = self.config['jsonrpc']['ipcpath']
+            try:
+                os.unlink(fn)
+            except OSError:
+                pass  # FIXME: incomplete error handling here
+
+            sock.bind(fn)
+            sock.listen(1)
+            listener = sock
+        self.wsgi_server = gevent.wsgi.WSGIServer(listener,
                                                   transport.handle, log=WSGIServerLogger)
         self.wsgi_thread = None
         self.rpc_server = RPCServerGreenlets(

@@ -166,7 +166,7 @@ def test_app(request, tmpdir):
                 }
             }
         },
-        'jsonrpc': {'listen_port': 29873}
+        'jsonrpc': {'ipcpath': '{}/myipc.sock'.format(tmpdir)}
     }
     services = [DBService, AccountsService, PeerManager, ChainService, PoWService, JSONRPCServer]
     update_config_with_defaults(config, get_default_config([TestApp] + services))

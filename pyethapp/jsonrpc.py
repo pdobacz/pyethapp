@@ -769,6 +769,23 @@ class Chain(Subdispatcher):
         return str(ETHProtocol.version)
 
     @public
+    def syncing(self):
+        if not self.chain.is_syncing:
+            return False
+        else:
+            synchronizer = self.chain.synchronizer
+            synctask = synchronizer.synctask
+            # print dir(synctask)
+            # print dir(synchronizer)
+            # print synctask.num_missing
+            result = dict(
+                startingBlock=synctask.start_block_number,
+                currentBlock=self.chain.chain.head.number,
+                highestBlock=synctask.end_block_number,
+            )
+            return {k: quantity_encoder(v) for k, v in result.items()}
+
+    @public
     @encode_res(quantity_encoder)
     def blockNumber(self):
         return self.chain.chain.head.number

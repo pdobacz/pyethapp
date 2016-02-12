@@ -133,10 +133,16 @@ class IPCDomainSocketTransport(ServerTransport):
         self.replies = queue_class()
 
     def handle(self, socket, address):
-        msg = socket.recv(4096)
-        self.messages.put((socket, msg))
-        reply = self.replies.get()
-        socket.sendall(reply)
+        while True:
+            try:
+                msg = socket.recv(4096)
+                if not msg:
+                    break
+                self.messages.put((socket, msg))
+                reply = self.replies.get()
+                socket.sendall(reply)
+            except IOError as e:
+                log.error("IOError on ipc socket", error=e.args)
 
     def receive_message(self):
         return self.messages.get()

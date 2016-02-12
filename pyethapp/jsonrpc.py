@@ -779,11 +779,7 @@ class Chain(Subdispatcher):
         if not self.chain.is_syncing:
             return False
         else:
-            synchronizer = self.chain.synchronizer
-            synctask = synchronizer.synctask
-            # print dir(synctask)
-            # print dir(synchronizer)
-            # print synctask.num_missing
+            synctask = self.chain.synchronizer.synctask
             result = dict(
                 startingBlock=synctask.start_block_number,
                 currentBlock=self.chain.chain.head.number,

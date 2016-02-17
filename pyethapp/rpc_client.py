@@ -146,11 +146,12 @@ class JSONRPCClient(object):
                         value=quantity_encoder, gasPrice=quantity_encoder,
                         gas=quantity_encoder, data=data_encoder,
                         v=quantity_encoder, r=quantity_encoder, s=quantity_encoder)
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        data['from'] = data.pop('sender')
-        assert data.get('from') or (v and r and s)
-        res = self.call('eth_sendTransaction', data)
+        data_out = {k: encoders[k](v) for k, v in locals().items()
+                    if k not in ('self', 'encoders') and v is not None}
+        data_out['from'] = data_out.pop('sender')
+        assert data_out.get('from') or (v and r and s)
+        data_out['to'] = '' if data == '' else data_out['to']
+        res = self.call('eth_sendTransaction', data_out)
         return data_decoder(res)
 
     def eth_call(self, sender='', to='', value=0, data='',

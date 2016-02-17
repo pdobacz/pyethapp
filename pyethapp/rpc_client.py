@@ -14,6 +14,8 @@ from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normali
 
 z_address = '\x00' * 20
 
+DEFAULT_TX_GAS = 3141591  # genesis block gasLimit - 1
+
 
 def address20(address):
     if address == '':
@@ -56,13 +58,14 @@ class JSONRPCClientReplyError(Exception):
 class JSONRPCClient(object):
     protocol = JSONRPCProtocol()
 
-    def __init__(self, port=4000, print_communication=True, privkey=None, sender=None):
+    def __init__(self, port=4000, print_communication=True, privkey=None, sender=None, default_tx_gas=None):
         "specify privkey for local signing"
         self.transport = HttpPostClientTransport('http://127.0.0.1:{}'.format(port))
         self.print_communication = print_communication
         self.privkey = privkey
         self._sender = sender
         self.port = port
+        self._default_tx_gas = default_tx_gas
 
     def __repr__(self):
         return '<JSONRPCClient @%d>' % self.port
@@ -74,6 +77,13 @@ class JSONRPCClient(object):
         if self._sender is None:
             self._sender = self.coinbase
         return self._sender
+
+    @property
+    def default_tx_gas(self):
+        if self._default_tx_gas:
+            return self._default_tx_gas
+        else:
+            return DEFAULT_TX_GAS
 
     def call(self, method, *args):
         request = self.protocol.create_request(method, args)
@@ -175,7 +185,8 @@ class JSONRPCClient(object):
         return b
 
     def gaslimit(self):
-        return quantity_decoder(self.call('eth_gasLimit'))
+        latest_block_info = self.call('eth_getBlockByNumber', 'latest', False)
+        return quantity_decoder(latest_block_info['gasLimit'])
 
     def lastgasprice(self):
         return quantity_decoder(self.call('eth_lastGasPrice'))
@@ -188,15 +199,12 @@ class JSONRPCClient(object):
             _sender = sender
             sender = privtoaddr(self.privkey)
             assert sender == _sender
-            # fetch nonce
-            nonce = nonce if nonce is not None else self.nonce(sender)
-        if nonce is None:
-            nonce = 0
-
+        # fetch nonce
+        nonce = nonce if nonce is not None else self.nonce(sender)
 
         assert sender
         if not startgas:
-            startgas = quantity_decoder(self.call('eth_gasLimit')) - 1
+            startgas = self.default_tx_gas
 
         # create transaction
         tx = Transaction(nonce, gasprice, startgas, to=to, value=value, data=data)

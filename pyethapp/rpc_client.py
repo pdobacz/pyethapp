@@ -150,7 +150,7 @@ class JSONRPCClient(object):
                     if k not in ('self', 'encoders') and v is not None}
         data_out['from'] = data_out.pop('sender')
         assert data_out.get('from') or (v and r and s)
-        data_out['to'] = '' if data == '' else data_out['to']
+        data_out['to'] = '' if to == '' else data_out['to']
         res = self.call('eth_sendTransaction', data_out)
         return data_decoder(res)
 

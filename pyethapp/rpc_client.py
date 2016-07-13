@@ -9,7 +9,8 @@ from ethereum.abi import ContractTranslator
 from ethereum.keys import privtoaddr
 from ethereum.transactions import Transaction
 from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
-from ethereum._solidity import solidity_unresolved_symbols, solidity_library_symbol, solidity_resolve_symbols
+from ethereum._solidity import solidity_unresolved_symbols, solidity_library_symbol, \
+    solidity_resolve_symbols
 from tinyrpc.protocols.jsonrpc import JSONRPCErrorResponse, JSONRPCSuccessResponse
 from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
 from tinyrpc.transports.http import HttpPostClientTransport
@@ -23,9 +24,7 @@ from pyethapp.jsonrpc import (
 # pylint: disable=invalid-name,too-many-arguments,too-few-public-methods
 # The number of arguments an it's names are determined by the JSON-RPC spec
 
-
 DEFAULT_TX_GAS = 3141591  # genesis block gasLimit - 1
-
 
 z_address = '\x00' * 20
 log = logging.getLogger(__name__)
@@ -120,7 +119,8 @@ class JSONRPCClientReplyError(Exception):
 class JSONRPCClient(object):
     protocol = JSONRPCProtocol()
 
-    def __init__(self, host='127.0.0.1', port=4000, print_communication=True, privkey=None, sender=None, default_tx_gas=None):
+    def __init__(self, host='127.0.0.1', port=4000, print_communication=True, privkey=None,
+                 sender=None, default_tx_gas=None):
         "specify privkey for local signing"
         self.transport = HttpPostClientTransport('http://{}:{}'.format(host, port))
         self.print_communication = print_communication
@@ -143,22 +143,16 @@ class JSONRPCClient(object):
         return self._sender
 
     @property
+    def coinbase(self):
+        """ Return the client coinbase address. """
+        return address_decoder(self.call('eth_coinbase'))
+
+    @property
     def default_tx_gas(self):
         if self._default_tx_gas:
             return self._default_tx_gas
         else:
             return DEFAULT_TX_GAS
-
-    def call(self, method, *args):
-        request = self.protocol.create_request(method, args)
-        reply = self.transport.send_message(request.serialize())
-        if self.print_communication:
-            print json.dumps(json.loads(request.serialize()), indent=2)
-            print reply
-
-    def coinbase(self):
-        """ Return the client coinbase address. """
-        return address_decoder(self.call('eth_coinbase'))
 
     def blocknumber(self):
         """ Return the most recent block. """
@@ -185,7 +179,8 @@ class JSONRPCClient(object):
         return quantity_decoder(res)
 
     def gaslimit(self):
-        return quantity_decoder(self.call('eth_gasLimit'))
+        latest_block_info = self.call('eth_getBlockByNumber', 'latest', False)
+        return quantity_decoder(latest_block_info['gasLimit'])
 
     def lastgasprice(self):
         return quantity_decoder(self.call('eth_lastGasPrice'))
@@ -375,28 +370,16 @@ class JSONRPCClient(object):
     def send_transaction(self, sender, to, value=0, data='', startgas=0,
                          gasprice=10 * denoms.szabo, nonce=None):
         """ Helper to send signed messages.
-
-<<<<<<< HEAD
-    def gaslimit(self):
-        latest_block_info = self.call('eth_getBlockByNumber', 'latest', False)
-        return quantity_decoder(latest_block_info['gasLimit'])
-=======
         This method will use the `privkey` provided in the constructor to
         locally sign the transaction. This requires an extended server
         implementation that accepts the variables v, r, and s.
         """
->>>>>>> develop
 
         if not self.privkey and not sender:
             raise ValueError('Either privkey or sender needs to be supplied.')
 
         if self.privkey and not sender:
             sender = privtoaddr(self.privkey)
-<<<<<<< HEAD
-            assert sender == _sender
-        # fetch nonce
-        nonce = nonce if nonce is not None else self.nonce(sender)
-=======
 
             if nonce is None:
                 nonce = self.nonce(sender)
@@ -409,14 +392,9 @@ class JSONRPCClient(object):
         else:
             if nonce is None:
                 nonce = 0
->>>>>>> develop
 
         if not startgas:
-<<<<<<< HEAD
             startgas = self.default_tx_gas
-=======
-            startgas = self.gaslimit() - 1
->>>>>>> develop
 
         tx = Transaction(nonce, gasprice, startgas, to=to, value=value, data=data)
 
@@ -652,7 +630,6 @@ class MethodProxy(object):
 
 class ContractProxy(object):
     """ Exposes a smart contract as a python object.
-
     Contract calls can be made directly in this object, all the functions will
     be exposed with the equivalent api and will perform the argument
     translation.

@@ -8,8 +8,9 @@ def test_find_block():
     client.find_block(lambda x: x == '0x5')
 
 
-def test_default_tx_gas():
-    client = JSONRPCClient()
+def test_default_tx_gas(test_app):
+    JSONRPCClient.call = lambda self, cmd, block_id, flag: test_app.rpc_request(cmd, block_id, flag)
+    client = JSONRPCClient(port=test_app.config['jsonrpc']['listen_port'])
     genesis_block_info = client.call('eth_getBlockByNumber', 'earliest', False)
     genesis_gas_limit = quantity_decoder(genesis_block_info['gasLimit'])
     assert client.default_tx_gas == (genesis_gas_limit - 1)

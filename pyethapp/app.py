@@ -1,39 +1,40 @@
 # -*- coding: utf8 -*-
-from ethereum import blocks
-from logging import StreamHandler
-from IPython.core import ultratb
+import copy
 import json
 import os
 import signal
 import sys
-import copy
+from logging import StreamHandler
 from uuid import uuid4
+
 import click
-from click import BadParameter
-import gevent
-from gevent.event import Event
-import rlp
-from devp2p.service import BaseService
-from devp2p.peermanager import PeerManager
-from devp2p.discovery import NodeDiscovery
-from devp2p.app import BaseApp
-import eth_protocol
-from eth_service import ChainService
-from console_service import Console
-from ethereum.blocks import Block
 import ethereum.slogging as slogging
+import gevent
+import rlp
+from click import BadParameter
+from devp2p.app import BaseApp
+from devp2p.discovery import NodeDiscovery
+from devp2p.peermanager import PeerManager
+from devp2p.service import BaseService
+from ethereum import blocks
+from ethereum.blocks import Block
+from gevent.event import Event
+
 import config as konfig
+import eth_protocol
+import utils
+from accounts import AccountsService, Account
+from console_service import Console
 from db_service import DBService
+from eth_service import ChainService
 from jsonrpc import JSONRPCServer, IPCRPCServer
 from pow_service import PoWService
-from accounts import AccountsService, Account
 from pyethapp import __version__
 from pyethapp.profiles import PROFILES, DEFAULT_PROFILE
-from pyethapp.utils import merge_dict, load_contrib_services
-import utils
+from pyethapp.utils import merge_dict, load_contrib_services, FallbackChoice, enable_greenlet_debugger
+
 
 log = slogging.get_logger('app')
-
 
 services = [DBService, AccountsService, NodeDiscovery, PeerManager, ChainService, PoWService,
             JSONRPCServer, IPCRPCServer, Console]
@@ -51,10 +52,16 @@ class EthApp(BaseApp):
     script_globals = {}
 
 
+# TODO: Remove `profile` fallbacks in 1.4 or so
 # Separators should be underscore!
 @click.group(help='Welcome to {} {}'.format(EthApp.client_name, EthApp.client_version))
-@click.option('--profile', type=click.Choice(PROFILES.keys()), default=DEFAULT_PROFILE,
-              help="Configuration profile.", show_default=True)
+@click.option('--profile', type=FallbackChoice(
+                  PROFILES.keys(),
+                  {'frontier': 'livenet', 'morden': 'testnet'},
+                  "PyEthApp's configuration profiles have been renamed to "
+                  "'livenet' and 'testnet'. The previous values 'frontier' and "
+                  "'morden' will be removed in a future update."),
+              default=DEFAULT_PROFILE, help="Configuration profile.", show_default=True)
 @click.option('alt_config', '--Config', '-C', type=str, callback=konfig.validate_alt_config_file,
               help='Alternative config file')
 @click.option('config_values', '-c', multiple=True, type=str,
@@ -100,6 +107,9 @@ def app(ctx, profile, alt_config, config_values, alt_data_dir, log_config, boots
     # Store custom genesis to restore if overridden by profile value
     genesis_from_config_file = config.get('eth', {}).get('genesis')
 
+    # Store custom bootstrap_nodes to restore them overridden by profile value
+    bootstrap_nodes_from_config_file = config.get('discovery', {}).get('bootstrap_nodes')
+
     # add default config
     konfig.update_config_with_defaults(config, konfig.get_default_config([EthApp] + services))
 
@@ -109,9 +119,14 @@ def app(ctx, profile, alt_config, config_values, alt_data_dir, log_config, boots
     merge_dict(config, PROFILES[profile])
 
     if genesis_from_config_file:
-        # Fixed genesis_hash taked from profile must be deleted as custom genesis loaded
+        # Fixed genesis_hash taken from profile must be deleted as custom genesis loaded
         del config['eth']['genesis_hash']
         config['eth']['genesis'] = genesis_from_config_file
+
+    if bootstrap_nodes_from_config_file:
+        # Fixed bootstrap_nodes taken from profile must be deleted as custom bootstrap_nodes loaded
+        del config['discovery']['bootstrap_nodes']
+        config['discovery']['bootstrap_nodes'] = bootstrap_nodes_from_config_file
 
     pre_cmd_line_config_genesis = config.get('eth', {}).get('genesis')
     # override values with values from cmd line
@@ -170,14 +185,15 @@ def run(ctx, dev, nodial, fake, console):
         blocks.GENESIS_DIFFICULTY = 1024
         blocks.BLOCK_DIFF_FACTOR = 16
         blocks.MIN_GAS_LIMIT = blocks.default_config['GENESIS_GAS_LIMIT'] / 2
+        config['eth']['block']['GENESIS_DIFFICULTY'] = 1024
+        config['eth']['block']['BLOCK_DIFF_FACTOR'] = 16
 
     # create app
     app = EthApp(config)
 
     # development mode
     if dev:
-        gevent.get_hub().SYSTEM_ERROR = BaseException
-        sys.excepthook = ultratb.VerboseTB(call_pdb=True, tb_offset=6)
+        enable_greenlet_debugger()
         try:
             config['client_version'] += '/' + os.getlogin()
         except:

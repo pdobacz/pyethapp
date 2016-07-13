@@ -603,7 +603,7 @@ class Personal(Subdispatcher):
 
     """Subdispatcher for account-related RPC methods.
 
-    NOTE: this do not seem to be part of the official JSON-RPC specs but instead part of
+    NOTE: this does not seem to be part of the official JSON-RPC specs but instead part of
     go-ethereum's JavaScript-Console: https://github.com/ethereum/go-ethereum/wiki/JavaScript-Console#personal
 
     It is needed for MIST-IPC.
@@ -853,7 +853,8 @@ class Chain(Subdispatcher):
     @encode_res(quantity_encoder)
     def getTransactionCount(self, address, block_id='pending'):
         block = self.json_rpc_server.get_block(block_id)
-        return block.get_nonce(address)
+        return block.get_nonce(address) - \
+            self.json_rpc_server.config['eth']['block']['ACCOUNT_INITIAL_NONCE']
 
     @public
     @decode_arg('block_hash', block_hash_decoder)
@@ -889,6 +890,8 @@ class Chain(Subdispatcher):
     @decode_arg('block_id', block_id_decoder)
     def getUncleCountByBlockNumber(self, block_id):
         try:
+            if block_id == u'pending':
+                return None
             block = self.json_rpc_server.get_block(block_id)
         except KeyError:
             return None
@@ -928,9 +931,11 @@ class Chain(Subdispatcher):
     def getTransactionByHash(self, tx_hash):
         try:
             tx, block, index = self.chain.chain.index.get_transaction(tx_hash)
+            if self.chain.chain.in_main_branch(block):
+                return tx_encoder(tx, block, index, False)
         except KeyError:
             return None
-        return tx_encoder(tx, block, index, False)
+        return None
 
     @public
     @decode_arg('block_hash', block_hash_decoder)
@@ -970,6 +975,9 @@ class Chain(Subdispatcher):
     @decode_arg('index', quantity_decoder)
     def getUncleByBlockNumberAndIndex(self, block_id, index):
         try:
+            #TODO: think about moving this check into the Block.uncles property
+            if block_id == u'pending':
+                return None
             block = self.json_rpc_server.get_block(block_id)
             uncle = block.uncles[index]
         except (IndexError, KeyError):
@@ -1035,6 +1043,24 @@ class Chain(Subdispatcher):
         return self.app.services.accounts.coinbase
 
     @public
+    @decode_arg('address', address_decoder)
+    @decode_arg('block_id', block_id_decoder)
+    @encode_res(quantity_encoder)
+    def nonce(self, address, block_id='pending'):
+        """
+        Return the `nonce` for `address` at the current `block_id
+        :param address:
+        :param block_id:
+        :return: the next nonce for the address/account
+        """
+        assert address is not None
+        block = self.json_rpc_server.get_block(block_id)
+        assert block is not None
+        nonce = block.get_nonce(address)
+        assert nonce is not None and isinstance(nonce, int)
+        return nonce
+
+    @public
     def sendTransaction(self, data):
         """
         extend spec to support v,r,s signed transactions
@@ -1072,11 +1098,40 @@ class Chain(Subdispatcher):
         tx = Transaction(nonce, gasprice, startgas, to, value, data_, v, r, s)
         tx._sender = None
         if not signed:
-            assert sender in self.app.services.accounts, 'no account for sender'
+            assert sender in self.app.services.accounts, 'can not sign: no account for sender'
             self.app.services.accounts.sign_tx(sender, tx)
         self.app.services.chain.add_transaction(tx, origin=None, force_broadcast=True)
         log.debug('decoded tx', tx=tx.log_dict())
         return data_encoder(tx.hash)
+
+    @public
+    @decode_arg('data', data_decoder)
+    def sendRawTransaction(self, data):
+        """
+        decode sendRawTransaction request data, format it and relay along to the sendTransaction method
+        to ensure the same validations and processing rules are applied
+        """
+        tx_data = rlp.codec.decode(data, ethereum.transactions.Transaction)
+
+        tx_dict = tx_data.to_dict()
+        # encode addresses
+        tx_dict['from'] = address_encoder(tx_dict.get('sender', ''))
+        to_value = tx_dict.get('to', '')
+        if to_value:
+            tx_dict['to'] = address_encoder(to_value)
+
+        # encode data
+        tx_dict['data'] = data_encoder(tx_dict.get('data', b''))
+
+        # encode quantities included in the raw transaction data
+        gasprice_key = 'gasPrice' if 'gasPrice' in tx_dict else 'gasprice'
+        gas_key = 'gas' if 'gas' in tx_dict else 'startgas'
+        for key in ('value', 'nonce', gas_key, gasprice_key, 'v', 'r', 's'):
+            if key in tx_dict:
+                tx_dict[key] = quantity_encoder(tx_dict[key])
+
+        # relay the information along to the sendTransaction method for processing
+        return self.sendTransaction(tx_dict)
 
     @public
     @decode_arg('block_id', block_id_decoder)
@@ -1095,11 +1150,12 @@ class Chain(Subdispatcher):
                 success, output = processblock.apply_transaction(test_block, tx)
                 assert success
         else:
-            test_block = ethereum.blocks.genesis(block.db)
+            env = ethereum.config.Env(db=block.db)
+            test_block = ethereum.blocks.genesis(env)
             original = {key: value for key, value in snapshot_before.items() if key != 'txs'}
             original = deepcopy(original)
             original['txs'] = Trie(snapshot_before['txs'].db, snapshot_before['txs'].root_hash)
-            test_block = ethereum.blocks.genesis(block.db)
+            test_block = ethereum.blocks.genesis(env)
             test_block.revert(original)
 
         # validate transaction
@@ -1569,6 +1625,8 @@ class FilterManager(Subdispatcher):
         try:
             tx, block, index = self.chain.chain.index.get_transaction(tx_hash)
         except KeyError:
+            return None
+        if not self.chain.chain.in_main_branch(block):
             return None
         receipt = block.get_receipt(index)
         response = {

@@ -1,35 +1,42 @@
-"""Provides a simple way of testing JSON RPC commands."""
+""" A simple way of interacting to a ethereum node through JSON RPC commands. """
+import logging
+import time
+import warnings
 import json
-from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
-from tinyrpc.protocols.jsonrpc import JSONRPCErrorResponse, JSONRPCSuccessResponse
-from tinyrpc.transports.http import HttpPostClientTransport
-from pyethapp.jsonrpc import quantity_encoder, quantity_decoder
-from pyethapp.jsonrpc import data_encoder, data_decoder, address_decoder
-from pyethapp.jsonrpc import address_encoder as _address_encoder
-from pyethapp.jsonrpc import default_gasprice, default_startgas
-from ethereum.transactions import Transaction
-from ethereum.keys import privtoaddr
-from ethereum import abi
-from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
 
-z_address = '\x00' * 20
+import gevent
+from ethereum.abi import ContractTranslator
+from ethereum.keys import privtoaddr
+from ethereum.transactions import Transaction
+from ethereum.utils import denoms, int_to_big_endian, big_endian_to_int, normalize_address
+from ethereum._solidity import solidity_unresolved_symbols, solidity_library_symbol, solidity_resolve_symbols
+from tinyrpc.protocols.jsonrpc import JSONRPCErrorResponse, JSONRPCSuccessResponse
+from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+from tinyrpc.transports.http import HttpPostClientTransport
+
+from pyethapp.jsonrpc import address_encoder as _address_encoder
+from pyethapp.jsonrpc import (
+    data_encoder, data_decoder, address_decoder, default_gasprice,
+    default_startgas, quantity_encoder, quantity_decoder,
+)
+
+# pylint: disable=invalid-name,too-many-arguments,too-few-public-methods
+# The number of arguments an it's names are determined by the JSON-RPC spec
+
 
 DEFAULT_TX_GAS = 3141591  # genesis block gasLimit - 1
 
 
-def address20(address):
-    if address == '':
-        return address
-    if len(address) == '42':
-        address = address[2:]
-    if len(address) == 40:
-        address = address.decode('hex')
-    assert len(address) == 20
-    return address
+z_address = '\x00' * 20
+log = logging.getLogger(__name__)
 
 
-def address_encoder(a):
-    return _address_encoder(normalize_address(a))
+def address_encoder(address):
+    """ Normalize address and hex encode it with the additional of the '0x'
+    prefix.
+    """
+    normalized_address = normalize_address(address, allow_blank=True)
+    return _address_encoder(normalized_address)
 
 
 def block_tag_encoder(val):
@@ -42,13 +49,68 @@ def block_tag_encoder(val):
         assert not val
 
 
-def topic_encoder(t):
-    assert isinstance(t, (int, long))
-    return data_encoder(int_to_big_endian(t))
+def topic_encoder(topic):
+    assert isinstance(topic, (int, long))
+    return data_encoder(int_to_big_endian(topic))
 
 
-def topic_decoder(t):
-    return big_endian_to_int(data_decoder(t))
+def topic_decoder(topic):
+    return big_endian_to_int(data_decoder(topic))
+
+
+def deploy_dependencies_symbols(all_contract):
+    dependencies = {}
+
+    symbols_to_contract = dict()
+    for contract_name in all_contract:
+        symbol = solidity_library_symbol(contract_name)
+
+        if symbol in symbols_to_contract:
+            raise ValueError('Conflicting library names.')
+
+        symbols_to_contract[symbol] = contract_name
+
+    for contract_name, contract in all_contract.items():
+        unresolved_symbols = solidity_unresolved_symbols(contract['bin_hex'])
+        dependencies[contract_name] = [
+            symbols_to_contract[unresolved]
+            for unresolved in unresolved_symbols
+        ]
+
+    return dependencies
+
+
+def dependencies_order_of_build(target_contract, dependencies_map):
+    """ Return an ordered list of contracts that is sufficient to sucessfully
+    deploys the target contract.
+
+    Note:
+        This function assumes that the `dependencies_map` is an acyclic graph.
+    """
+    if len(dependencies_map) == 0:
+        return [target_contract]
+
+    if target_contract not in dependencies_map:
+        raise ValueError('no dependencies defined for {}'.format(target_contract))
+
+    order = [target_contract]
+    todo = list(dependencies_map[target_contract])
+
+    while len(todo):
+        target_contract = todo.pop(0)
+        target_pos = len(order)
+
+        for dependency in dependencies_map[target_contract]:
+            # we need to add the current contract before all it's depedencies
+            if dependency in order:
+                target_pos = order.index(dependency)
+            else:
+                todo.append(dependency)
+
+        order.insert(target_pos, target_contract)
+
+    order.reverse()
+    return order
 
 
 class JSONRPCClientReplyError(Exception):
@@ -58,9 +120,9 @@ class JSONRPCClientReplyError(Exception):
 class JSONRPCClient(object):
     protocol = JSONRPCProtocol()
 
-    def __init__(self, port=4000, print_communication=True, privkey=None, sender=None, default_tx_gas=None):
+    def __init__(self, host='127.0.0.1', port=4000, print_communication=True, privkey=None, sender=None, default_tx_gas=None):
         "specify privkey for local signing"
-        self.transport = HttpPostClientTransport('http://127.0.0.1:{}'.format(port))
+        self.transport = HttpPostClientTransport('http://{}:{}'.format(host, port))
         self.print_communication = print_communication
         self.privkey = privkey
         self._sender = sender
@@ -74,8 +136,10 @@ class JSONRPCClient(object):
     def sender(self):
         if self.privkey:
             return privtoaddr(self.privkey)
+
         if self._sender is None:
             self._sender = self.coinbase
+
         return self._sender
 
     @property
@@ -92,15 +156,143 @@ class JSONRPCClient(object):
             print json.dumps(json.loads(request.serialize()), indent=2)
             print reply
 
-        jsonrpc_reply = self.protocol.parse_reply(reply)
-        if isinstance(jsonrpc_reply, JSONRPCSuccessResponse):
-            return jsonrpc_reply.result
-        elif isinstance(jsonrpc_reply, JSONRPCErrorResponse):
-            raise JSONRPCClientReplyError(jsonrpc_reply.error)
-        else:
-            raise JSONRPCClientReplyError('Unknown type of JSONRPC reply')
+    def coinbase(self):
+        """ Return the client coinbase address. """
+        return address_decoder(self.call('eth_coinbase'))
 
-    __call__ = call
+    def blocknumber(self):
+        """ Return the most recent block. """
+        return quantity_decoder(self.call('eth_blockNumber'))
+
+    def nonce(self, address):
+        if len(address) == 40:
+            address = address.decode('hex')
+
+        try:
+            res = self.call('eth_nonce', address_encoder(address), 'pending')
+            return quantity_decoder(res)
+        except JSONRPCClientReplyError as e:
+            if e.message == 'Method not found':
+                raise JSONRPCClientReplyError(
+                    "'eth_nonce' is not supported by your endpoint (pyethapp only). "
+                    "For transactions use server-side nonces: "
+                    "('eth_sendTransaction' with 'nonce=None')")
+            raise e
+
+    def balance(self, account):
+        """ Return the balance of the account of given address. """
+        res = self.call('eth_getBalance', address_encoder(account), 'pending')
+        return quantity_decoder(res)
+
+    def gaslimit(self):
+        return quantity_decoder(self.call('eth_gasLimit'))
+
+    def lastgasprice(self):
+        return quantity_decoder(self.call('eth_lastGasPrice'))
+
+    def new_abi_contract(self, contract_interface, address):
+        warnings.warn('deprecated, use new_contract_proxy', DeprecationWarning)
+        return self.new_contract_proxy(contract_interface, address)
+
+    def new_contract_proxy(self, contract_interface, address):
+        """ Return a proxy for interacting with a smart contract.
+
+        Args:
+            contract_interface: The contract interface as defined by the json.
+            address: The contract's address.
+        """
+        sender = self.sender or privtoaddr(self.privkey)
+
+        return ContractProxy(
+            sender,
+            contract_interface,
+            address,
+            self.eth_call,
+            self.send_transaction,
+        )
+
+    def deploy_solidity_contract(self, sender, contract_name, all_contracts,  # pylint: disable=too-many-locals
+                                 libraries, contructor_paramenters, timeout=None):
+
+        if contract_name not in all_contracts:
+            raise ValueError('Unkonwn contract {}'.format(contract_name))
+
+        libraries = dict(libraries)
+        contract = all_contracts[contract_name]
+        contract_interface = contract['abi']
+        symbols = solidity_unresolved_symbols(contract['bin_hex'])
+
+        if symbols:
+            available_symbols = map(solidity_library_symbol, all_contracts.keys())  # pylint: disable=bad-builtin
+
+            unknown_symbols = set(symbols) - set(available_symbols)
+            if unknown_symbols:
+                msg = 'Cannot deploy contract, known symbols {}, unresolved symbols {}.'.format(
+                    available_symbols,
+                    unknown_symbols,
+                )
+                raise Exception(msg)
+
+            dependencies = deploy_dependencies_symbols(all_contracts)
+            deployment_order = dependencies_order_of_build(contract_name, dependencies)
+
+            deployment_order.pop()  # remove `contract_name` from the list
+
+            log.debug('Deploing dependencies: {}'.format(str(deployment_order)))
+
+            for deploy_contract in deployment_order:
+                dependency_contract = all_contracts[deploy_contract]
+
+                hex_bytecode = solidity_resolve_symbols(dependency_contract['bin_hex'], libraries)
+                bytecode = hex_bytecode.decode('hex')
+
+                dependency_contract['bin_hex'] = hex_bytecode
+                dependency_contract['bin'] = bytecode
+
+                transaction_hash = self.send_transaction(
+                    sender,
+                    to='',
+                    data=bytecode,
+                    gasprice=denoms.wei,
+                )
+
+                self.poll(transaction_hash.decode('hex'), timeout=timeout)
+                receipt = self.call('eth_getTransactionReceipt', '0x' + transaction_hash)
+
+                contract_address = receipt['contractAddress']
+                libraries[deploy_contract] = contract_address[2:]  # remove the hexadecimal prefix 0x from the address
+
+            hex_bytecode = solidity_resolve_symbols(contract['bin_hex'], libraries)
+            bytecode = hex_bytecode.decode('hex')
+
+            contract['bin_hex'] = hex_bytecode
+            contract['bin'] = bytecode
+
+        if contructor_paramenters:
+            translator = ContractTranslator(contract_interface)
+            parameters = translator.encode_constructor_arguments(contructor_paramenters)
+            bytecode = contract['bin'] + parameters
+        else:
+            bytecode = contract['bin']
+
+        transaction_hash = self.send_transaction(
+            sender,
+            to='',
+            data=bytecode,
+            gasprice=denoms.wei,
+        )
+
+        self.poll(transaction_hash.decode('hex'), timeout=timeout)
+        receipt = self.call('eth_getTransactionReceipt', '0x' + transaction_hash)
+        contract_address = receipt['contractAddress']
+
+        return ContractProxy(
+            sender,
+            contract_interface,
+            contract_address,
+            self.eth_call,
+            self.send_transaction,
+        )
 
     def find_block(self, condition):
         """Query all blocks one by one and return the first one for which
@@ -113,13 +305,28 @@ class JSONRPCClient(object):
                 return block
             i += 1
 
-    def new_filter(self, fromBlock="", toBlock="", address=None, topics=[]):
-        encoders = dict(fromBlock=block_tag_encoder, toBlock=block_tag_encoder,
-                        address=address_encoder, topics=lambda x: [topic_encoder(t) for t in x])
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        fid = self.call('eth_newFilter', data)
-        return quantity_decoder(fid)
+    def new_filter(self, fromBlock=None, toBlock=None, address=None, topics=None):
+        """ Creates a filter object, based on filter options, to notify when
+        the state changes (logs). To check if the state has changed, call
+        eth_getFilterChanges.
+        """
+
+        json_data = {
+            'fromBlock': block_tag_encoder(fromBlock or ''),
+            'toBlock': block_tag_encoder(toBlock or ''),
+        }
+
+        if address is not None:
+            json_data['address'] = address_encoder(address)
+
+        if topics is not None:
+            if not isinstance(topics, list):
+                raise ValueError('topics must be a list')
+
+            json_data['topics'] = [topic_encoder(topic) for topic in topics]
+
+        filter_id = self.call('eth_newFilter', json_data)
+        return quantity_decoder(filter_id)
 
     def filter_changes(self, fid):
         changes = self.call('eth_getFilterChanges', quantity_encoder(fid))
@@ -138,146 +345,350 @@ class JSONRPCClient(object):
                             transactionIndex=quantity_decoder)
             return [{k: decoders[k](v) for k, v in c.items() if v is not None} for c in changes]
 
-    def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',
-                            gasPrice=default_gasprice, gas=default_startgas,
-                            v=None, r=None, s=None):
-        to = normalize_address(to, allow_blank=True)
-        encoders = dict(nonce=quantity_encoder, sender=address_encoder, to=data_encoder,
-                        value=quantity_encoder, gasPrice=quantity_encoder,
-                        gas=quantity_encoder, data=data_encoder,
-                        v=quantity_encoder, r=quantity_encoder, s=quantity_encoder)
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        data['from'] = data.pop('sender')
-        assert data.get('from') or (v and r and s)
-        res = self.call('eth_sendTransaction', data)
-        return data_decoder(res)
+    def call(self, method, *args):
+        """ Do the request and returns the result.
 
-    def eth_call(self, sender='', to='', value=0, data='',
-                 startgas=default_startgas, gasprice=default_gasprice):
-        "call on pending block"
-        encoders = dict(sender=address_encoder, to=data_encoder,
-                        value=quantity_encoder, gasprice=quantity_encoder,
-                        startgas=quantity_encoder, data=data_encoder)
-        data = {k: encoders[k](v) for k, v in locals().items()
-                if k not in ('self', 'encoders') and v is not None}
-        for k, v in dict(gasprice='gasPrice', startgas='gas', sender='from').items():
-            data[v] = data.pop(k)
-        res = self.call('eth_call', data)
-        return data_decoder(res)
+        Args:
+            method (str): The RPC method.
+            args: The encoded arguments expected by the method.
+                - Object arguments must be supplied as an dictionary.
+                - Quantity arguments must be hex encoded starting with '0x' and
+                without left zeros.
+                - Data arguments must be hex encoded starting with '0x'
+        """
+        request = self.protocol.create_request(method, args)
+        reply = self.transport.send_message(request.serialize())
+        if self.print_communication:
+            print json.dumps(json.loads(request.serialize()), indent=2)
+            print reply
 
-    def blocknumber(self):
-        return quantity_decoder(self.call('eth_blockNumber'))
+        jsonrpc_reply = self.protocol.parse_reply(reply)
+        if isinstance(jsonrpc_reply, JSONRPCSuccessResponse):
+            return jsonrpc_reply.result
+        elif isinstance(jsonrpc_reply, JSONRPCErrorResponse):
+            raise JSONRPCClientReplyError(jsonrpc_reply.error)
+        else:
+            raise JSONRPCClientReplyError('Unknown type of JSONRPC reply')
 
-    def nonce(self, address):
-        if len(address) == 40:
-            address = address.decode('hex')
-        return quantity_decoder(
-            self.call('eth_getTransactionCount', address_encoder(address), 'pending'))
-
-    @property
-    def coinbase(self):
-        return address_decoder(self.call('eth_coinbase'))
-
-    def balance(self, account):
-        b = quantity_decoder(
-            self.call('eth_getBalance', address_encoder(account), 'pending'))
-        return b
-
-    def gaslimit(self):
-        latest_block_info = self.call('eth_getBlockByNumber', 'latest', False)
-        return quantity_decoder(latest_block_info['gasLimit'])
-
-    def lastgasprice(self):
-        return quantity_decoder(self.call('eth_lastGasPrice'))
+    __call__ = call
 
     def send_transaction(self, sender, to, value=0, data='', startgas=0,
                          gasprice=10 * denoms.szabo, nonce=None):
-        "can send a locally signed transaction if privkey is given"
-        assert self.privkey or sender
-        if self.privkey:
-            _sender = sender
+        """ Helper to send signed messages.
+
+<<<<<<< HEAD
+    def gaslimit(self):
+        latest_block_info = self.call('eth_getBlockByNumber', 'latest', False)
+        return quantity_decoder(latest_block_info['gasLimit'])
+=======
+        This method will use the `privkey` provided in the constructor to
+        locally sign the transaction. This requires an extended server
+        implementation that accepts the variables v, r, and s.
+        """
+>>>>>>> develop
+
+        if not self.privkey and not sender:
+            raise ValueError('Either privkey or sender needs to be supplied.')
+
+        if self.privkey and not sender:
             sender = privtoaddr(self.privkey)
+<<<<<<< HEAD
             assert sender == _sender
         # fetch nonce
         nonce = nonce if nonce is not None else self.nonce(sender)
+=======
 
-        assert sender
+            if nonce is None:
+                nonce = self.nonce(sender)
+        elif self.privkey:
+            if sender != privtoaddr(self.privkey):
+                raise ValueError('sender for a different privkey.')
+
+            if nonce is None:
+                nonce = self.nonce(sender)
+        else:
+            if nonce is None:
+                nonce = 0
+>>>>>>> develop
+
         if not startgas:
+<<<<<<< HEAD
             startgas = self.default_tx_gas
+=======
+            startgas = self.gaslimit() - 1
+>>>>>>> develop
 
-        # create transaction
         tx = Transaction(nonce, gasprice, startgas, to=to, value=value, data=data)
+
         if self.privkey:
+            # add the fields v, r and s
             tx.sign(self.privkey)
+
         tx_dict = tx.to_dict()
+
+        # rename the fields to match the eth_sendTransaction signature
         tx_dict.pop('hash')
-        for k, v in dict(gasprice='gasPrice', startgas='gas').items():
-            tx_dict[v] = tx_dict.pop(k)
         tx_dict['sender'] = sender
+        tx_dict['gasPrice'] = tx_dict.pop('gasprice')
+        tx_dict['gas'] = tx_dict.pop('startgas')
+
         res = self.eth_sendTransaction(**tx_dict)
         assert len(res) in (20, 32)
         return res.encode('hex')
 
-    def new_abi_contract(self, _abi, address):
-        sender = self.sender or privtoaddr(self.privkey)
-        return ABIContract(sender, _abi, address, self.eth_call, self.send_transaction)
+    def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',
+                            gasPrice=default_gasprice, gas=default_startgas,
+                            v=None, r=None, s=None):
+        """ Creates new message call transaction or a contract creation, if the
+        data field contains code.
+
+        Note:
+            The support for local signing through the variables v,r,s is not
+            part of the standard spec, a extended server is required.
+
+        Args:
+            from (address): The 20 bytes address the transaction is send from.
+            to (address): DATA, 20 Bytes - (optional when creating new
+                contract) The address the transaction is directed to.
+            gas (int): Gas provided for the transaction execution. It will
+                return unused gas.
+            gasPrice (int): gasPrice used for each paid gas.
+            value (int): Value send with this transaction.
+            data (bin): The compiled code of a contract OR the hash of the
+                invoked method signature and encoded parameters.
+            nonce (int): This allows to overwrite your own pending transactions
+                that use the same nonce.
+        """
+
+        if to == '' and data.isalnum():
+            warnings.warn(
+                'Verify that the data parameter is _not_ hex encoded, if this is the case '
+                'the data will be double encoded and result in unexpected '
+                'behavior.'
+            )
+
+        if to == '0' * 40:
+            warnings.warn('For contract creating the empty string must be used.')
+
+        json_data = {
+            'to': data_encoder(normalize_address(to, allow_blank=True)),
+            'value': quantity_encoder(value),
+            'gasPrice': quantity_encoder(gasPrice),
+            'gas': quantity_encoder(gas),
+            'data': data_encoder(data),
+        }
+
+        if not sender and not (v and r and s):
+            raise ValueError('Either sender or v, r, s needs to be informed.')
+
+        if sender is not None:
+            json_data['from'] = address_encoder(sender)
+
+        if v and r and s:
+            json_data['v'] = quantity_encoder(v)
+            json_data['r'] = quantity_encoder(r)
+            json_data['s'] = quantity_encoder(s)
+
+        if nonce is not None:
+            json_data['nonce'] = quantity_encoder(nonce)
+
+        res = self.call('eth_sendTransaction', json_data)
+
+        return data_decoder(res)
+
+    def eth_call(self, sender='', to='', value=0, data='',
+                 startgas=default_startgas, gasprice=default_gasprice,
+                 block_number=None):
+        """ Executes a new message call immediately without creating a
+        transaction on the block chain.
+
+        Args:
+            from: The address the transaction is send from.
+            to: The address the transaction is directed to.
+            gas (int): Gas provided for the transaction execution. eth_call
+                consumes zero gas, but this parameter may be needed by some
+                executions.
+            gasPrice (int): gasPrice used for each paid gas.
+            value (int): Integer of the value send with this transaction.
+            data (bin): Hash of the method signature and encoded parameters.
+                For details see Ethereum Contract ABI.
+            block_number: Determines the state of ethereum used in the
+                call.
+        """
+
+        json_data = dict()
+
+        if sender is not None:
+            json_data['from'] = address_encoder(sender)
+
+        if to is not None:
+            json_data['to'] = data_encoder(to)
+
+        if value is not None:
+            json_data['value'] = quantity_encoder(value)
+
+        if gasprice is not None:
+            json_data['gasPrice'] = quantity_encoder(gasprice)
+
+        if startgas is not None:
+            json_data['gas'] = quantity_encoder(startgas)
+
+        if data is not None:
+            json_data['data'] = data_encoder(data)
+
+        if block_number is not None:
+            res = self.call('eth_call', json_data, block_number)
+        else:
+            res = self.call('eth_call', json_data)
+
+        return data_decoder(res)
+
+    def poll(self, transaction_hash, confirmations=None, timeout=None):
+        """ Wait until the `transaction_hash` is applied or rejected.
+
+        Args:
+            transaction_hash (hash): Transaction hash that we are waiting for.
+            confirmations (int): Number of block confirmations that we will
+                wait for.
+            timeout (float): Timeout in seconds, raise an Excpetion on
+                timeout.
+        """
+        if transaction_hash.startswith('0x'):
+            warnings.warn(
+                'transaction_hash seems to be already encoded, this will result '
+                'in unexpected behavior'
+            )
+
+        if len(transaction_hash) != 32:
+            raise ValueError('transaction_hash length must be 32 (it might be hex encode)')
+
+        deadline = None
+        if timeout:
+            deadline = time.time() + timeout
+
+        transaction_hash = data_encoder(transaction_hash)
+
+        pending_block = self.call('eth_getBlockByNumber', 'pending', True)
+        while any(tx['hash'] == transaction_hash for tx in pending_block['transactions']):
+            if deadline and time.time() > deadline:
+                raise Exception('timeout')
+
+            gevent.sleep(.5)
+            pending_block = self.call('eth_getBlockByNumber', 'pending', True)
+
+        transaction = self.call('eth_getTransactionByHash', transaction_hash)
+
+        if transaction is None:
+            # either wrong transaction hash or the transaction was invalid
+            log.error('transaction {} not found.'.format(transaction_hash))
+            return
+
+        if confirmations is None:
+            return
+
+        # this will wait for both APPLIED and REVERTED transactions
+        transaction_block = quantity_decoder(transaction['blockNumber'])
+        confirmation_block = transaction_block + confirmations
+
+        block_number = self.blocknumber()
+        while confirmation_block > block_number:
+            if deadline and time.time() > deadline:
+                raise Exception('timeout')
+
+            gevent.sleep(.5)
+            block_number = self.blocknumber()
 
 
-class ABIContract():
+class MethodProxy(object):
+    """ A callable interface that exposes a contract function. """
+    valid_kargs = set(('gasprice', 'startgas', 'value'))
 
+    def __init__(self, sender, contract_address, function_name, translator,
+                 call_function, transaction_function):
+        self.sender = sender
+        self.contract_address = contract_address
+        self.function_name = function_name
+        self.translator = translator
+        self.call_function = call_function
+        self.transaction_function = transaction_function
+
+    def transact(self, *args, **kargs):
+        assert set(kargs.keys()).issubset(self.valid_kargs)
+        data = self.translator.encode(self.function_name, args)
+
+        txhash = self.transaction_function(
+            sender=self.sender,
+            to=self.contract_address,
+            value=kargs.pop('value', 0),
+            data=data,
+            **kargs
+        )
+
+        return txhash
+
+    def call(self, *args, **kargs):
+        assert set(kargs.keys()).issubset(self.valid_kargs)
+        data = self.translator.encode(self.function_name, args)
+
+        res = self.call_function(
+            sender=self.sender,
+            to=self.contract_address,
+            value=kargs.pop('value', 0),
+            data=data,
+            **kargs
+        )
+
+        if res:
+            res = self.translator.decode(self.function_name, res)
+            res = res[0] if len(res) == 1 else res
+        return res
+
+    def __call__(self, *args, **kargs):
+        if self.translator.function_data[self.function_name]['is_constant']:
+            return self.call(*args, **kargs)
+        else:
+            return self.transact(*args, **kargs)
+
+
+class ContractProxy(object):
+    """ Exposes a smart contract as a python object.
+
+    Contract calls can be made directly in this object, all the functions will
+    be exposed with the equivalent api and will perform the argument
+    translation.
     """
-    proxy for a contract
-    """
 
-    def __init__(self, sender, _abi, address, call_func, transact_func):
-        self._translator = abi.ContractTranslator(_abi)
-        self.abi = _abi
-        self.address = address = normalize_address(address)
+    def __init__(self, sender, abi, address, call_func, transact_func):
         sender = normalize_address(sender)
-        valid_kargs = set(('gasprice', 'startgas', 'value'))
 
-        class abi_method(object):
+        self.abi = abi
+        self.address = address = normalize_address(address)
+        self.translator = ContractTranslator(abi)
 
-            def __init__(this, f):
-                this.f = f
+        for function_name in self.translator.function_data:
+            function_proxy = MethodProxy(
+                sender,
+                address,
+                function_name,
+                self.translator,
+                call_func,
+                transact_func,
+            )
 
-            def transact(this, *args, **kargs):
-                assert set(kargs.keys()).issubset(valid_kargs)
-                data = self._translator.encode(this.f, args)
-                txhash = transact_func(sender=sender,
-                                       to=address,
-                                       value=kargs.pop('value', 0),
-                                       data=data,
-                                       **kargs)
-                return txhash
+            type_argument = self.translator.function_data[function_name]['signature']
 
-            def call(this, *args, **kargs):
-                assert set(kargs.keys()).issubset(valid_kargs)
-                data = self._translator.encode(this.f, args)
-                res = call_func(sender=sender,
-                                to=address,
-                                value=kargs.pop('value', 0),
-                                data=data,
-                                **kargs)
-                if res:
-                    res = self._translator.decode(this.f, res)
-                    res = res[0] if len(res) == 1 else res
-                return res
+            arguments = [
+                '{type} {argument}'.format(type=type_, argument=argument)
+                for type_, argument in type_argument
+            ]
+            function_signature = ', '.join(arguments)
 
-            def __call__(this, *args, **kargs):
-                if self._translator.function_data[this.f]['is_constant']:
-                    return this.call(*args, **kargs)
-                else:
-                    return this.transact(*args, **kargs)
+            function_proxy.__doc__ = '{function_name}({function_signature})'.format(
+                function_name=function_name,
+                function_signature=function_signature,
+            )
 
-        for fname in self._translator.function_data:
-            func = abi_method(fname)
-            # create wrapper with signature
-            signature = self._translator.function_data[fname]['signature']
-            func.__doc__ = '%s(%s)' % (fname, ', '.join(('%s %s' % x) for x in signature))
-            setattr(self, fname, func)
+            setattr(self, function_name, function_proxy)
 
-
-if __name__ == '__main__':
-    pass
+# backwards compatibility
+ABIContract = ContractProxy

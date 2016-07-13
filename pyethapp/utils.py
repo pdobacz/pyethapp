@@ -1,12 +1,20 @@
+import signal
+import warnings
 from collections import Mapping
 import os
+
+import click
 import ethereum
+import gevent
+from IPython.core import ultratb
 from ethereum.blocks import Block, genesis
 from devp2p.service import BaseService
 import rlp
 import sys
 from ethereum import slogging
+from ethereum.slogging import bcolors
 import types
+
 
 slogging.set_level('db', 'debug')
 log = slogging.get_logger('db')
@@ -128,3 +136,31 @@ def merge_dict(dest, source):
                 else:
                     curr_dest[key] = curr_source[key]
     return dest
+
+
+class FallbackChoice(click.Choice):
+    def __init__(self, choices, fallbacks, fallback_warning):
+        super(FallbackChoice, self).__init__(choices)
+        self.fallbacks = fallbacks
+        self.fallback_warning = fallback_warning
+
+    def convert(self, value, param, ctx):
+        if value in self.fallbacks:
+            warnings.warn(self.fallback_warning)
+            value = self.fallbacks[value]
+        return super(FallbackChoice, self).convert(value, param, ctx)
+
+
+def enable_greenlet_debugger():
+    def _print_exception(self, context, type_, value, traceback):
+        ultratb.VerboseTB(call_pdb=True)(type_, value, traceback)
+        resp = raw_input(
+            "{c.OKGREEN}Debugger exited. "
+            "{c.OKBLUE}Do you want to quit pyethapp?{c.ENDC} [{c.BOLD}Y{c.ENDC}/n] ".format(
+                c=bcolors
+            )
+        ).strip().lower()
+        if not resp or resp.startswith("y"):
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    gevent.get_hub().__class__.print_exception = _print_exception

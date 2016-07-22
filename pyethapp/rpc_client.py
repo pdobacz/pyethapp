@@ -437,7 +437,7 @@ class JSONRPCClient(object):
             warnings.warn('For contract creating the empty string must be used.')
 
         json_data = {
-            'to': data_encoder(normalize_address(to, allow_blank=True)),
+            'to': data_encoder(normalize_address(to, allow_blank=True), allow_blank=True),
             'value': quantity_encoder(value),
             'gasPrice': quantity_encoder(gasPrice),
             'gas': quantity_encoder(gas),

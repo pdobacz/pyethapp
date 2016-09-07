@@ -402,7 +402,7 @@ class JSONRPCClient(object):
         assert len(res) in (20, 32)
         return res.encode('hex')
 
-    def eth_sendTransaction(self, nonce=None, sender='', to='', value=0, data='',
+    def eth_sendTransaction(self, nonce=None, sender='', to=None, value=0, data='',
                             gasPrice=default_gasprice, gas=default_startgas,
                             v=None, r=None, s=None):
         """ Creates new message call transaction or a contract creation, if the
@@ -426,23 +426,22 @@ class JSONRPCClient(object):
                 that use the same nonce.
         """
 
-        if to == '' and data.isalnum():
+        if (to is None) and data.isalnum():
             warnings.warn(
                 'Verify that the data parameter is _not_ hex encoded, if this is the case '
                 'the data will be double encoded and result in unexpected '
                 'behavior.'
             )
 
-        if to == '0' * 40:
-            warnings.warn('For contract creating the empty string must be used.')
-
         json_data = {
-            'to': data_encoder(normalize_address(to, allow_blank=True), allow_blank=True),
             'value': quantity_encoder(value),
             'gasPrice': quantity_encoder(gasPrice),
             'gas': quantity_encoder(gas),
             'data': data_encoder(data),
         }
+
+        if to is not None:
+            json_data['to'] = address_encoder(to)
 
         if not sender and not (v and r and s):
             raise ValueError('Either sender or v, r, s needs to be informed.')

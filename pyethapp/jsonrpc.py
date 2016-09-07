@@ -382,16 +382,12 @@ def data_decoder(data):
         raise BadRequestError('Invalid data hex encoding', data[2:])
 
 
-def data_encoder(data, length=None, allow_blank=False):
+def data_encoder(data, length=None):
     """Encode unformatted binary `data`.
 
     If `length` is given, the result will be padded like this: ``data_encoder('\xff', 3) ==
     '0x0000ff'``.
     """
-    # allow_blank for contract deployment
-    if allow_blank and data in {'', b''}:
-        return b''
-
     s = encode_hex(data)
     if length is None:
         return '0x' + s

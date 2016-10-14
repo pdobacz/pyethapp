@@ -396,9 +396,6 @@ class JSONRPCClient(object):
 
             if nonce is None:
                 nonce = self.nonce(sender)
-        else:
-            if nonce is None:
-                nonce = 0
 
         if not startgas:
             startgas = self.gaslimit() - 1
